@@ -1,0 +1,40 @@
+# ---- dependencies ----
+node_modules/
+vendor/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+
+# ---- build output ----
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+.turbo/
+coverage/
+
+# ---- local data ----
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.mv.db
+*.trace.db
+
+# ---- env and logs ----
+.env
+.env.local
+.env.*.local
+*.log
+*.pid
+.DS_Store
+Thumbs.db
+
+# ---- editor ----
+.idea/
+.vscode/
