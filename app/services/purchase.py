@@ -196,53 +196,16 @@ class PurchaseService:
         quantity: Optional[int] = None,
         expected_date: Optional[date] = None
     ) -> PurchaseOrder:
-        suggestion = crud_purchase_suggestion.get(db, suggestion_id)
-        if not suggestion:
-            raise ValueError(f"采购建议不存在: {suggestion_id}")
-        if suggestion.status != "pending":
-            raise ValueError(f"采购建议状态为 {suggestion.status}，不可转单")
-        final_supplier_id = supplier_id or suggestion.suggested_supplier_id
-        if not final_supplier_id:
-            raise ValueError("必须指定供应商")
-        final_quantity = quantity or suggestion.suggested_quantity
-
-        capacity = crud_supply_capacity.get_by_supplier_and_material(
-            db, final_supplier_id, suggestion.material_id
-        )
-        capacity_warning = None
-        if capacity:
-            coverage_ratio, actual_dd, can_cover = PurchaseService._evaluate_supplier_capacity(
-                capacity, final_quantity
-            )
-            if not can_cover:
-                stock = capacity.current_stock or 0
-                daily = capacity.daily_capacity or 0
-                days = capacity.delivery_days or 0
-                max_able = stock + daily * days
-                capacity_warning = (
-                    f"供应商库存({stock})+{days}天产能({daily * days})={max_able}，"
-                    f"无法覆盖需求{final_quantity}，缺口{final_quantity - max_able}"
-                )
-        else:
-            actual_dd = 30
-
-        final_date = expected_date or suggestion.expected_delivery_date or (
-            date.today() + timedelta(days=actual_dd)
-        )
-        remark_parts = [f"由采购建议#{suggestion_id}生成"]
-        if capacity_warning:
-            remark_parts.append(capacity_warning)
-
-        from app.schemas import PurchaseOrderCreate
-        order_in = PurchaseOrderCreate(
+        """转单统一走产能预约服务：同一事务内重新核对可用量并占用，
+        避免两个采购小组把同一供应商产能重复计入。"""
+        from app.services.capacity import CapacityService
+        order, _reservation = CapacityService.convert_suggestion_with_capacity(
+            db,
+            suggestion_id=suggestion_id,
             order_no=order_no,
-            supplier_id=final_supplier_id,
-            material_id=suggestion.material_id,
-            quantity=final_quantity,
-            expected_date=final_date,
-            status="ordered",
-            remark="；".join(remark_parts)
+            supplier_id=supplier_id,
+            quantity=quantity,
+            start_date=date.today(),
+            expected_date=expected_date,
         )
-        order = crud_purchase_order.create(db, obj_in=order_in)
-        crud_purchase_suggestion.update(db, db_obj=suggestion, obj_in={"status": "converted"})
         return order

@@ -3,7 +3,7 @@ import tempfile
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from app.database import Base, get_db
+from app.database import Base, get_db, apply_sqlite_concurrency
 from app.main import app
 
 
@@ -14,9 +14,12 @@ def db_engine():
     engine = create_engine(
         SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
     )
+    # 与生产一致的 WAL + BEGIN IMMEDIATE 并发语义，保证并发测试真实有效
+    apply_sqlite_concurrency(engine)
     Base.metadata.create_all(bind=engine)
     yield engine
     Base.metadata.drop_all(bind=engine)
+    engine.dispose()
     os.close(db_fd)
     os.unlink(db_path)
 

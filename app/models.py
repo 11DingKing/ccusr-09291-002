@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Date
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Date, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -70,6 +70,8 @@ class Supplier(Base):
     supply_capacities = relationship("SupplyCapacity", back_populates="supplier")
     purchase_orders = relationship("PurchaseOrder", back_populates="supplier")
     deliveries = relationship("Delivery", back_populates="supplier")
+    capacity_reservations = relationship("CapacityReservation", back_populates="supplier")
+    calendar_overrides = relationship("ProductionCalendar", back_populates="supplier")
 
 class SupplyCapacity(Base):
     __tablename__ = "supply_capacities"
@@ -86,6 +88,7 @@ class SupplyCapacity(Base):
 
     supplier = relationship("Supplier", back_populates="supply_capacities")
     material = relationship("Material", back_populates="supply_capacities")
+    reservations = relationship("CapacityReservation", back_populates="capacity")
 
 class PurchaseSuggestion(Base):
     __tablename__ = "purchase_suggestions"
@@ -119,6 +122,7 @@ class PurchaseOrder(Base):
     material = relationship("Material", back_populates="purchase_orders")
     deliveries = relationship("Delivery", back_populates="purchase_order")
     delay_impacts = relationship("DelayImpact", back_populates="purchase_order")
+    reservation = relationship("CapacityReservation", back_populates="purchase_order", uselist=False)
 
 class Delivery(Base):
     __tablename__ = "deliveries"
@@ -274,4 +278,159 @@ class SupplierShortageImpact(Base):
     confirmation = relationship("SupplierConfirmation", back_populates="shortage_impacts")
     production_batch = relationship("ProductionBatch")
     vehicle_model = relationship("VehicleModel")
+    material = relationship("Material")
+
+
+class ProductionCalendar(Base):
+    """生产日历：停产日（节假日）与加班日。
+
+    一条记录只表达“与默认日历不同的那一天”：
+    - day_type=closed  表示该日停产（即使是工作日/周末）
+    - day_type=working 表示该日加班生产（即使是周末）
+    supplier_id 为空时是全厂日历；非空时为该供应商专属日历，优先于全厂日历。
+    日历只影响“新预约如何展开到各天”，不会改变已经固化的既有占用。
+    """
+    __tablename__ = "production_calendar"
+    id = Column(Integer, primary_key=True, index=True)
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True, index=True)
+    calendar_date = Column(Date, nullable=False, index=True)
+    day_type = Column(String(20), nullable=False, default="closed")
+    name = Column(String(100))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    supplier = relationship("Supplier", back_populates="calendar_overrides")
+
+    __table_args__ = (
+        UniqueConstraint("supplier_id", "calendar_date", name="uq_calendar_supplier_date"),
+        CheckConstraint("day_type IN ('closed', 'working')", name="ck_calendar_day_type"),
+    )
+
+
+class CapacityReservation(Base):
+    """供应商产能预约：按日期区间预约、占用、释放、失效。
+
+    占用量在创建时按生产日历固化到 capacity_reservation_days 的每一行，
+    此后节假日调整、重叠预约、部分释放、并发预约或服务重启都不会改写既有占用。
+    状态：reserved（已预约/占用中）、released（已释放）、expired（超期失效）、
+    cancelled（已取消）。purchase_order_id 非空表示该预约已被转单正式占用。
+    """
+    __tablename__ = "capacity_reservations"
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_no = Column(String(50), unique=True, index=True, nullable=False)
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=False, index=True)
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False, index=True)
+    supply_capacity_id = Column(Integer, ForeignKey("supply_capacities.id"), nullable=False)
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    quantity = Column(Integer, nullable=False)
+    daily_quantity = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="reserved", index=True)
+    owner_team = Column(String(50), nullable=False, default="default")
+    purchase_suggestion_id = Column(Integer, ForeignKey("purchase_suggestions.id"), nullable=True)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=True, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    released_at = Column(DateTime(timezone=True), nullable=True)
+    expired_at = Column(DateTime(timezone=True), nullable=True)
+    release_reason = Column(String(300))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    supplier = relationship("Supplier", back_populates="capacity_reservations")
+    material = relationship("Material")
+    capacity = relationship("SupplyCapacity", back_populates="reservations")
+    purchase_suggestion = relationship("PurchaseSuggestion")
+    purchase_order = relationship("PurchaseOrder", back_populates="reservation")
+    days = relationship(
+        "CapacityReservationDay", back_populates="reservation",
+        cascade="all, delete-orphan"
+    )
+    events = relationship(
+        "CapacityReservationEvent", back_populates="reservation",
+        cascade="all, delete-orphan"
+    )
+    decisions = relationship(
+        "CapacityDecision", back_populates="reservation",
+        cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint("end_date >= start_date", name="ck_reservation_date_range"),
+        CheckConstraint("quantity > 0 AND daily_quantity > 0", name="ck_reservation_qty_positive"),
+        CheckConstraint(
+            "status IN ('reserved', 'released', 'expired', 'cancelled')",
+            name="ck_reservation_status"
+        ),
+    )
+
+
+class CapacityReservationDay(Base):
+    """预约展开后的逐日占用快照。创建时固化，永不被日历变更改写。
+
+    释放是追加式的：整单释放时把每行 remaining_quantity 清零；
+    部分释放只减少指定日期的 remaining_quantity，原始占用量保留在 quantity 列。
+    """
+    __tablename__ = "capacity_reservation_days"
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_id = Column(
+        Integer, ForeignKey("capacity_reservations.id"), nullable=False, index=True
+    )
+    day_date = Column(Date, nullable=False, index=True)
+    quantity = Column(Integer, nullable=False)
+    remaining_quantity = Column(Integer, nullable=False)
+    is_working_day = Column(Boolean, nullable=False, default=True)
+
+    reservation = relationship("CapacityReservation", back_populates="days")
+
+    __table_args__ = (
+        UniqueConstraint("reservation_id", "day_date", name="uq_reservation_day"),
+        CheckConstraint("remaining_quantity >= 0", name="ck_day_remaining_nonneg"),
+    )
+
+
+class CapacityReservationEvent(Base):
+    """预约生命周期事件流水：create / confirm / release / partial_release /
+    expire / cancel，以及改期（reschedule）。只追加，不修改。"""
+    __tablename__ = "capacity_reservation_events"
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_id = Column(
+        Integer, ForeignKey("capacity_reservations.id"), nullable=False, index=True
+    )
+    event_type = Column(String(30), nullable=False)
+    quantity = Column(Integer, nullable=False, default=0)
+    detail = Column(Text)
+    actor = Column(String(50))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reservation = relationship("CapacityReservation", back_populates="events")
+
+
+class CapacityDecision(Base):
+    """每次容量决定（预约创建、转单、改期、释放等）的依据留存。
+
+    basis_json 保存决定时刻的完整快照：逐日产能日历、当时已有占用、
+    可用量、候选区间、采用算法/规则版本，便于事后审计“当时为什么允许/拒绝”。
+    """
+    __tablename__ = "capacity_decisions"
+    id = Column(Integer, primary_key=True, index=True)
+    decision_no = Column(String(50), unique=True, index=True, nullable=False)
+    reservation_id = Column(
+        Integer, ForeignKey("capacity_reservations.id"), nullable=True, index=True
+    )
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=False)
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False)
+    decision_type = Column(String(30), nullable=False)
+    result = Column(String(20), nullable=False)
+    requested_quantity = Column(Integer, nullable=False, default=0)
+    start_date = Column(Date)
+    end_date = Column(Date)
+    available_quantity = Column(Integer, nullable=False, default=0)
+    rule_version = Column(String(20), nullable=False, default="v1")
+    basis_json = Column(Text, nullable=False)
+    reason = Column(String(500))
+    actor = Column(String(50))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    reservation = relationship("CapacityReservation", back_populates="decisions")
+    supplier = relationship("Supplier")
     material = relationship("Material")

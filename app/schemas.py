@@ -510,3 +510,169 @@ class SupplierConfirmationStatistics(BaseModel):
 class ExtendedStatisticsResponse(StatisticsResponse):
     supplier_confirmation_stats: SupplierConfirmationStatistics
     supplier_bottlenecks: List[SupplierBottleneckAnalysis]
+
+
+# ===== 供应商产能预约 =====
+
+class ProductionCalendarBase(BaseModel):
+    calendar_date: date
+    day_type: str = "closed"
+    name: Optional[str] = None
+    supplier_id: Optional[int] = None
+
+class ProductionCalendarUpsert(ProductionCalendarBase):
+    pass
+
+class ProductionCalendar(ProductionCalendarBase):
+    id: int
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+class CapacityReservationDay(BaseModel):
+    day_date: date
+    quantity: int
+    remaining_quantity: int
+    is_working_day: bool
+    class Config:
+        from_attributes = True
+
+
+class CapacityReservationEvent(BaseModel):
+    id: int
+    event_type: str
+    quantity: int
+    detail: Optional[str] = None
+    actor: Optional[str] = None
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+class CapacityReservationBase(BaseModel):
+    supplier_id: int
+    material_id: int
+    quantity: int = Field(..., gt=0)
+    start_date: date
+    end_date: date
+    owner_team: str = "default"
+    purchase_suggestion_id: Optional[int] = None
+    expires_in_hours: Optional[int] = Field(
+        24, ge=0, description="预约有效期（小时），到期未转单自动失效；0 表示长期有效"
+    )
+    actor: Optional[str] = None
+
+class CapacityReservationCreate(CapacityReservationBase):
+    pass
+
+class CapacityReservation(BaseModel):
+    id: int
+    reservation_no: str
+    supplier_id: int
+    material_id: int
+    supply_capacity_id: int
+    start_date: date
+    end_date: date
+    quantity: int
+    daily_quantity: int
+    status: str
+    owner_team: str
+    purchase_suggestion_id: Optional[int] = None
+    purchase_order_id: Optional[int] = None
+    expires_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    release_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    days: List[CapacityReservationDay] = []
+    class Config:
+        from_attributes = True
+
+
+class CapacityDayAvailability(BaseModel):
+    day_date: date
+    is_working_day: bool
+    daily_capacity: int
+    occupied_quantity: int
+    available_quantity: int
+
+
+class CapacityAvailabilityQuery(BaseModel):
+    supplier_id: int
+    material_id: int
+    start_date: date
+    end_date: date
+    quantity: Optional[int] = Field(None, gt=0)
+
+
+class CapacityAvailability(BaseModel):
+    supplier_id: int
+    material_id: int
+    start_date: date
+    end_date: date
+    daily_capacity: int
+    total_capacity: int
+    occupied_quantity: int
+    available_quantity: int
+    sufficient: bool
+    working_days: int
+    days: List[CapacityDayAvailability]
+
+
+class CapacityReleaseRequest(BaseModel):
+    quantity: Optional[int] = Field(
+        None, gt=0, description="只传数量=按日期从后往前部分释放；不传=整单释放"
+    )
+    dates: Optional[List[date]] = Field(
+        None, description="指定释放的具体日期（可只释放部分数量需配合 date_quantities）"
+    )
+    date_quantities: Optional[dict] = None
+    reason: Optional[str] = None
+    actor: Optional[str] = None
+
+
+class CapacityRescheduleRequest(BaseModel):
+    new_supplier_id: Optional[int] = None
+    new_start_date: Optional[date] = None
+    new_end_date: Optional[date] = None
+    new_quantity: Optional[int] = Field(None, gt=0)
+    reason: Optional[str] = None
+    actor: Optional[str] = None
+
+
+class CapacityDecisionBase(BaseModel):
+    id: int
+    decision_no: str
+    reservation_id: Optional[int] = None
+    supplier_id: int
+    material_id: int
+    decision_type: str
+    result: str
+    requested_quantity: int
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    available_quantity: int
+    rule_version: str
+    basis_json: str
+    reason: Optional[str] = None
+    actor: Optional[str] = None
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+class ConvertWithCapacityRequest(BaseModel):
+    """采购建议转单请求：在同一事务内核对产能并占用。"""
+    order_no: str
+    supplier_id: Optional[int] = None
+    quantity: Optional[int] = Field(None, gt=0)
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    expected_date: Optional[date] = None
+    reservation_id: Optional[int] = Field(
+        None, description="已有预约号则直接确认占用；不传则现场核对并新建占用"
+    )
+    actor: Optional[str] = None
